@@ -1,0 +1,448 @@
+#############################################################################################################################
+# This is a generated file which includes some replacements.                                                                #
+# It is still very much recommended to go through this and ensure all variables are correct for your business/domain        #
+# All variables are defined in a global scope.                                                                              #
+# All Terraform produced resource names are using a labels module ensuring a predictable naming convention                  #
+# E.g.: variables for company, project, stage and component will produce a name of `$company-$project-$stage-$component`    #
+# NB: Some resources e.g. blob storage only allow for alpha numeric characters so the name is adjusted accordingly          #
+#  ==> `$company$project$stage$component`                                                                                   #
+#############################################################################################################################
+name: "$(Build.SourceBranchName)-init"
+
+pr:
+  - master
+
+trigger:
+  branches:
+    include:
+      - 'master'
+  paths:
+    include:
+      - '*'
+
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: amido/stacks-pipeline-templates
+      ref: refs/tags/v2.0.4
+      # EXCHANGE THIS FOR YOUR OWN ENDPOINT CONNECTION TO GITHUB
+      # REPOSITORY IS PUBLIC
+      endpoint: amidostacks
+
+  containers:
+    - container: sonar_scanner
+      image: amidostacks/ci-sonarscanner:0.0.2
+    - container: k8s_deploy
+      image: amidostacks/ci-k8s:0.0.12
+    - container: terraform_custom
+      image: amidostacks/ci-tf:0.0.8
+
+variables:
+  - template: azuredevops-vars.yml
+
+  #
+  # SelfConfig
+  # If you haven't specified source_repo at cli runtime please ensure you replace it here
+  # It is case sensitive for TFS based repos
+  - name: self_repo_src
+    value: src/csr
+  - name: self_repo_dir
+    value: "$(Agent.BuildDirectory)/s/$(self_repo)"
+  - name: self_project_dir
+    value: "$(self_repo_dir)/$(self_repo_src)"
+  - name: self_repo_tf_src
+    value: deploy/azure/app/csr
+  - name: self_repo_tf_dir
+    value: "$(self_repo_dir)/$(self_repo_tf_src)"
+  - name: self_pipeline_repo
+    value: "$(Agent.BuildDirectory)/s/stacks-pipeline-templates"
+  - name: self_pipeline_scripts_dir
+    value: "$(self_pipeline_repo)/scripts"
+
+  # Versioning
+  - name: version_major
+    value: 0
+  - name: version_minor
+    value: 0
+  - name: version_revision
+    value: $[counter(join(variables['version_major'], join('-', variables['version_minor'])), 0)]
+  - name: version_build_number
+    value: "$(version_major).$(version_minor).$(version_revision)-$(Build.SourceBranchName)"
+
+  # BUILD ARTIFACTS across stages
+  - name: build_artifact_deploy_path
+    value: $(self_project_dir)
+  - name: build_artifact_deploy_name
+    value: $(self_generic_name)
+
+  - name: pool_vm_image
+    value: ubuntu-20.04
+
+  # Yamllint
+  - name: yamllint_config_file
+    value: "${{ variables.self_repo_dir }}/yamllint.conf"
+  - name: yamllint_scan_directory
+    value: "."
+
+stages:
+  - stage: Build
+    variables:
+      - group: amido-stacks-infra-credentials-nonprod
+      - group: stacks-credentials-nonprod-kv
+      - group: amido-stacks-webapp-csr
+      - name: azure_tenant_id
+        value: "$(azure-tenant-id)"
+      - name: azure_subscription_id
+        value: "$(azure-subscription-id)"
+      - name: azure_client_id
+        value: "$(azure-client-id)"
+      - name: azure_client_secret
+        value: "$(azure-client-secret)"
+    jobs:
+      - job: WebAppBuild
+        pool:
+          vmImage: $(pool_vm_image)
+        steps:
+          - checkout: self
+
+          - checkout: templates
+
+          # Updates the build number in Azure DevOps (requires refresh in the UI to see)
+          - bash: |
+              echo '##vso[Build.UpdateBuildNumber]${{ variables.version_build_number }}'
+            displayName: 'Update: Build Number'
+
+          # Validates all YAML files in the repo to check they adhere to standards
+          - template: templates/steps/build/test-validate-yaml.yml
+            parameters:
+              pipeline_scripts_directory: "${{ variables.self_pipeline_scripts_dir }}"
+              container: "k8s_deploy"
+              yamllint_config_file: "${{ variables.yamllint_config_file }}"
+              yamllint_scan_directory: "${{ variables.yamllint_scan_directory }}"
+
+          # Runs a terraform fomatting check and a validation check
+          - template: templates/steps/build/test-validate-terraform.yml
+            parameters:
+              pipeline_scripts_directory: "${{ variables.self_pipeline_scripts_dir }}"
+              terraform_container: "terraform_custom"
+              terraform_directory: "${{ variables.self_repo_tf_dir }}"
+
+          # Build Project
+          - template: templates/steps/build/build-csr.yml
+            parameters:
+              version_build_number: "$(version_build_number)"
+              # Docker Config
+              login_azure: true
+              # Vulnerability Scanning
+              vulnerability_scan: false
+              vulnerability_workdir: "$(Build.ArtifactStagingDirectory)"
+              # Sonar settings
+              static_code_analysis: false
+              # Linting and formatting validation
+              shared_eslint_config: "@amidostacks/eslint-config@latest"
+              # Should be hardcoded in your sonar-project.properties file
+              unit_test: true
+              project_root_dir: $(self_project_dir)
+              cypress_e2e_test: false
+              cypress_e2e_env_vars:
+                PORT: 3000
+                APP_BASE_URL: "http://localhost"
+                MENU_API_URL: "https://dev-netcore-api.$(base_doman_nonprod)/api/menu"
+                APP_BASE_PATH: ""
+                NODE_ENV: dev
+                # avoid warnings about terminal
+                TERM: xterm
+              # Build Output File
+              # files to be persisted across stages
+              build_file: true
+              build_file_path: $(build_artifact_deploy_path)
+              build_file_artefact: $(build_artifact_deploy_name)
+
+  - stage: Dev
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.SourceBranch'], 'refs/heads/master'))
+    variables:
+      - group: amido-stacks-infra-credentials-nonprod
+      - group: stacks-credentials-nonprod-kv
+      - group: amido-stacks-webapp-csr
+      - name: Environment.ShortName
+        value: dev
+    jobs:
+      - deployment: AppInfraDev
+        pool:
+          vmImage: $(pool_vm_image)
+        container: terraform_custom
+        environment: ${{ variables.domain }}-dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+
+                - checkout: self
+
+                - checkout: templates
+
+                # Create TF infra
+                - template: azDevOps/azure/templates/v2/steps/login-services.yml@templates
+                  parameters:
+                    container: terraform_custom  # force the use of the current container which has the login credentials
+                    login_azure: true
+                    azure_tenant_id: $(azure-tenant-id)
+                    azure_subscription_id: $(azure-subscription-id)
+                    azure_client_id: $(azure-client-id)
+                    azure_client_secret: $(azure-client-secret)
+
+                - template: azDevOps/azure/templates/v2/steps/deploy-terraform-meta-generic.yml@templates
+                  parameters:
+                    # Terraform Basic Config
+                    working_dir: '$(self_repo_tf_dir)'
+                    # changing this would require changing the downstream consumers of these outputs
+                    #
+                    terraform_output_artefact: 'tfoutputs'
+                    # Auth config
+                    terraform_auth_properties: {
+                      ARM_CLIENT_ID: $(azure-client-id),
+                      ARM_CLIENT_SECRET: $(azure-client-secret),
+                      ARM_SUBSCRIPTION_ID: $(azure-subscription-id),
+                      ARM_TENANT_ID: $(azure-tenant-id)
+                    }
+                    # Terraform State Config
+                    terraform_init_backend_config: '-backend-config="key=$(tf_state_key)" -backend-config="storage_account_name=$(tf_state_storage)" -backend-config="resource_group_name=$(tf_state_rg)" -backend-config="container_name=$(tf_state_container)"'
+                    terraform_state_workspace: $(Environment.ShortName)
+                    tags: ''
+                    # Terraform Resource Specific Config
+                    terraform_extra_properties: {
+                      TF_VAR_resource_group_location: $(region),
+                      TF_VAR_name_company: $(company),
+                      TF_VAR_name_project: $(project),
+                      TF_VAR_name_component: $(domain),
+                      TF_VAR_name_environment: $(Environment.ShortName),
+                      TF_VAR_stage: $(Environment.ShortName),
+                      TF_VAR_index_document: "index.html",
+                      TF_VAR_notfound_document: "404.html",
+                      TF_VAR_enabled: "true",
+                      TF_VAR_dns_zone: $(base_domain_nonprod),
+                      TF_VAR_dns_record: $(Environment.ShortName)-csr-app,
+                      TF_VAR_app_insights_name: $(tf_app_insights_name_nonprod),
+                      TF_VAR_create_dns_zone: false,
+                      TF_VAR_dns_resource_group: "$(dns_zone_resource_group)",
+                      TF_VAR_response_header_cdn: '[
+                        {
+                          action: "Append",
+                          name: "Content-Security-Policy",
+                          value: "default-src * ''unsafe-inline'' ''unsafe-eval''"
+                        },
+                        {
+                          action:"Append",
+                          name: "Cache-Control",
+                          value: "no-cache"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-Frame-Options",
+                          value: "SAMEORIGIN"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-Content-Type-Options",
+                          value: "nosniff"
+                        },
+                        {
+                          action: "Append",
+                          name: "Strict-Transport-Security",
+                          value: "max-age=63072000"
+                        },
+                        {
+                          action: "Append",
+                          name: "Referrer-Policy",
+                          value: "no-referrer-when-downgrade"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-XSS-Protection",
+                          value: "1; mode=block;"
+                        }
+                      ]'
+                    }
+                    terraform_output_commands: |
+                      raw_tf=$(terraform output -json | jq -r 'keys[] as $k | "##vso[task.setvariable variable=\($k);isOutput=true]\(.[$k] | .value)"')
+                      readarray -t outputs <<<"$raw_tf"
+                      for i in "${outputs[@]}"; do echo "$i"; done
+
+      - deployment: DeployDev
+        dependsOn: AppInfraDev
+        container: k8s_deploy
+        variables:
+          storage_account_name: $[ dependencies.AppInfraDev.outputs['AppInfraDev.tfoutputs.storage_account_name'] ]
+          storage_account_key: $[ dependencies.AppInfraDev.outputs['AppInfraDev.tfoutputs.storage_account_key'] ]
+          dns_name: $[ dependencies.AppInfraDev.outputs['AppInfraDev.tfoutputs.dns_name'] ]
+          app_insights_instrumentation_key: $[ dependencies.AppInfraDev.outputs['AppInfraDev.tfoutputs.app_insights_instrumentation_key'] ]
+        pool:
+          vmImage: ubuntu-18.04
+        environment: ${{ variables.domain}}-dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - checkout: templates
+
+                - template: azDevOps/azure/templates/v2/steps/deploy-csr-azure.yml@templates
+                  parameters:
+                    build_artifact: $(build_artifact_deploy_name)
+                    storage_account_name: $(storage_account_name)
+                    storage_account_key: $(storage_account_key)
+                    build_command: 'npm run build'
+                    build_vars: {
+                      NODE_ENV: production,
+                      MENU_API_URL: "https://$(Environment.ShortName)-netcore-app.$(base_domain_nonprod)/api/menu",
+                      APPINSIGHTS_INSTRUMENTATIONKEY: $(app_insights_instrumentation_key)
+                    }
+                    build_out: './dist'
+
+  - stage: Prod
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    variables:
+      - group: amido-stacks-infra-credentials-prod
+      - group: stacks-credentials-prod-kv
+      - group: amido-stacks-webapp-csr
+      - name: Environment.ShortName
+        value: prod
+    jobs:
+      - deployment: AppInfraProd
+        pool:
+          vmImage: $(pool_vm_image)
+        container: terraform_custom
+        environment: ${{ variables.domain }}-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - download: none
+
+                - checkout: self
+
+                - checkout: templates
+
+                # Create TF infra
+                - template: azDevOps/azure/templates/v2/steps/login-services.yml@templates
+                  parameters:
+                    container: terraform_custom  # force the use of the current container which has the login credentials
+                    login_azure: true
+                    azure_tenant_id: $(prod-azure-tenant-id)
+                    azure_subscription_id: $(prod-azure-subscription-id)
+                    azure_client_id: $(prod-azure-client-id)
+                    azure_client_secret: $(prod-azure-client-secret)
+
+                - template: azDevOps/azure/templates/v2/steps/deploy-terraform-meta-generic.yml@templates
+                  parameters:
+                    # Terraform Basic Config
+                    working_dir: '$(self_repo_tf_dir)'
+                    # changing this would require changing the downstream consumers of these outputs
+                    #
+                    terraform_output_artefact: 'tfoutputs'
+                    # Auth config
+                    terraform_auth_properties: {
+                      ARM_CLIENT_ID: $(prod-azure-client-id),
+                      ARM_CLIENT_SECRET: $(prod-azure-client-secret),
+                      ARM_SUBSCRIPTION_ID: $(prod-azure-subscription-id),
+                      ARM_TENANT_ID: $(prod-azure-tenant-id)
+                    }
+                    # Terraform State Config
+                    terraform_init_backend_config: '-backend-config="key=$(tf_state_key)" -backend-config="storage_account_name=$(tf_state_storage)" -backend-config="resource_group_name=$(tf_state_rg)" -backend-config="container_name=$(tf_state_container)"'
+                    terraform_state_workspace: $(Environment.ShortName)
+                    tags: ''
+                    # Terraform Resource Specific Config
+                    terraform_extra_properties: {
+                      TF_VAR_resource_group_location: $(region),
+                      TF_VAR_name_company: $(company),
+                      TF_VAR_name_project: $(project),
+                      TF_VAR_name_component: $(domain),
+                      TF_VAR_name_environment: $(Environment.ShortName),
+                      TF_VAR_stage: $(Environment.ShortName),
+                      TF_VAR_index_document: "index.html",
+                      TF_VAR_notfound_document: "404.html",
+                      TF_VAR_enabled: "true",
+                      TF_VAR_dns_zone: $(base_domain_prod),
+                      TF_VAR_dns_record: $(Environment.ShortName)-csr-app,
+                      TF_VAR_app_insights_name: $(tf_app_insights_name_prod),
+                      TF_VAR_create_dns_zone: false,
+                      TF_VAR_dns_resource_group: "$(dns_zone_resource_group)",
+                      TF_VAR_response_header_cdn: '[
+                        {
+                          action: "Append",
+                          name: "Content-Security-Policy",
+                          value: "default-src * ''unsafe-inline'' ''unsafe-eval''"
+                        },
+                        {
+                          action:"Append",
+                          name: "Cache-Control",
+                          value: "no-cache"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-Frame-Options",
+                          value: "SAMEORIGIN"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-Content-Type-Options",
+                          value: "nosniff"
+                        },
+                        {
+                          action: "Append",
+                          name: "Strict-Transport-Security",
+                          value: "max-age=63072000"
+                        },
+                        {
+                          action: "Append",
+                          name: "Referrer-Policy",
+                          value: "no-referrer-when-downgrade"
+                        },
+                        {
+                          action: "Append",
+                          name: "X-XSS-Protection",
+                          value: "1; mode=block;"
+                        }
+                      ]'
+                    }
+                    terraform_output_commands: |
+                      raw_tf=$(terraform output -json | jq -r 'keys[] as $k | "##vso[task.setvariable variable=\($k);isOutput=true]\(.[$k] | .value)"')
+                      readarray -t outputs <<<"$raw_tf"
+                      for i in "${outputs[@]}"; do echo "$i"; done
+
+      - deployment: DeployProd
+        dependsOn: AppInfraProd
+        container: k8s_deploy
+        variables:
+          storage_account_name: $[ dependencies.AppInfraProd.outputs['AppInfraProd.tfoutputs.storage_account_name'] ]
+          storage_account_key: $[ dependencies.AppInfraProd.outputs['AppInfraProd.tfoutputs.storage_account_key'] ]
+          dns_name: $[ dependencies.AppInfraProd.outputs['AppInfraProd.tfoutputs.dns_name'] ]
+          app_insights_instrumentation_key: $[ dependencies.AppInfraProd.outputs['AppInfraProd.tfoutputs.app_insights_instrumentation_key'] ]
+        pool:
+          vmImage: $(pool_vm_image)
+        environment: ${{ variables.domain}}-prod
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - checkout: templates
+
+                - template: azDevOps/azure/templates/v2/steps/deploy-csr-azure.yml@templates
+                  parameters:
+                    build_artifact: $(build_artifact_deploy_name)
+                    storage_account_name: $(storage_account_name)
+                    storage_account_key: $(storage_account_key)
+                    build_command: 'npm run build'
+                    build_vars: {
+                      NODE_ENV: production,
+                      MENU_API_URL: "https://$(Environment.ShortName)-netcore-app.$(base_domain_prod)/api/menu",
+                      APPINSIGHTS_INSTRUMENTATIONKEY: $(app_insights_instrumentation_key)
+                    }
+                    build_out: './dist'
